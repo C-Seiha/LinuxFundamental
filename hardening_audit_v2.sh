@@ -198,20 +198,21 @@ parse_args() {
 audit_open_ports() {
     section "MODULE 1 — Open Port Scan (nmap)"
 
-    log "INFO" "Running SYN scan on $IFACE. This may take a moment..."
+    log "INFO" "Running SYN scan against localhost. This may take a moment..."
 
     local nmap_out
-    # -sS: SYN scan | -O: OS detection | --open: show open ports only
-    nmap_out="$(nmap -sS -O --open -e "$IFACE" localhost 2>/dev/null || true)"
-
-    if [[ -z "$nmap_out" ]]; then
-        log "WARN" "nmap returned no output — check interface or permissions."
-        return
-    fi
+    # -sS: SYN scan | --open: show open ports only
+    nmap_out="$(nmap -sS --open localhost 2>/dev/null || true)"
 
     # Count lines that start with a port number
     local open_count
     open_count="$(echo "$nmap_out" | grep -c "^[0-9]" || true)"
+
+    if [[ -z "$nmap_out" || "$open_count" -eq 0 ]]; then
+        log "WARN" "nmap SYN scan returned no results (may lack CAP_NET_RAW, e.g. in a container) — falling back to ss."
+        audit_open_ports_ss
+        return
+    fi
 
     log "INFO" "Open ports detected: $open_count"
     echo "$nmap_out" | grep -E "^(PORT|[0-9])" | while IFS= read -r line; do
@@ -228,6 +229,36 @@ audit_open_ports() {
 
     if [[ "$open_count" -eq 0 ]]; then
         log "PASS" "No open ports detected."
+    fi
+}
+
+# Fallback port audit using ss (works without raw-socket privileges)
+audit_open_ports_ss() {
+    local ss_out
+    ss_out="$(ss -tulnH 2>/dev/null || true)"
+
+    if [[ -z "$ss_out" ]]; then
+        log "WARN" "ss returned no output either — unable to audit listening ports."
+        return
+    fi
+
+    local open_count
+    open_count="$(echo "$ss_out" | wc -l || true)"
+    log "INFO" "Listening sockets detected via ss: $open_count"
+
+    echo "$ss_out" | while IFS= read -r line; do
+        log "INFO" "  $line"
+    done
+
+    local risky_ports=("21" "23" "25" "111" "135" "139" "445" "512" "513" "514")
+    for port in "${risky_ports[@]}"; do
+        if echo "$ss_out" | grep -qE ":${port}\b"; then
+            log "FAIL" "High-risk port open: $port — consider closing if unused."
+        fi
+    done
+
+    if [[ "$open_count" -eq 0 ]]; then
+        log "PASS" "No listening ports detected."
     fi
 }
 
