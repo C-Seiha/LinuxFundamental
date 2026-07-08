@@ -1,4 +1,22 @@
 #!/usr/bin/env bash
+# =============================================================================
+# hardening_audit.sh — System Hardening Auditor
+# =============================================================================
+# Description : Audits a Linux system for common security misconfigurations:
+#               open ports, SUID/SGID files, SSH hardening, world-writable
+#               paths, password policy, firewall state, and sudoers risks.
+#               Produces a timestamped plain-text report in OUTPUT_DIR.
+#
+# Usage       : sudo ./hardening_audit.sh [OPTIONS]
+# Options     :
+#   -o DIR    Output directory for the report (default: ./audit_reports)
+#   -i IFACE  Network interface for port scan (default: auto-detected)
+#   -s        Silent mode — suppress colour output to terminal
+#   -h        Show this help message
+#
+# Requirements: nmap, ss, find, awk, grep, id, sudo (run as root)
+# Tested on   : Kali Linux 2024.x, Ubuntu 22.04 LTS, Debian 12
+# =============================================================================
 
 set -euo pipefail
 
@@ -111,7 +129,9 @@ check_root() {
 
 # Confirm required tools are installed before any audit runs
 check_dependencies() {
-    local deps=("nmap" "ss" "ip" "find" "awk" "grep" "cut" "stat" "id")
+    local deps=("nmap" "ss" "ip" "find" "awk" "grep" "cut" "stat" "id" \
+    "hostname" "date" "basename" "sort" "head" "tail" "tr" "systemctl")
+    
     local missing=()
 
     for dep in "${deps[@]}"; do
@@ -180,27 +200,49 @@ parse_args() {
 audit_open_ports() {
     section "MODULE 1 — Open Port Scan (nmap)"
 
-    log "INFO" "Running SYN scan against localhost. This may take a moment..."
+    local iface_ip
+    iface_ip="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || true)"
+
+    if [[ -z "$iface_ip" ]]; then
+        log "WARN" "Interface $IFACE has no IPv4 address — scanning localhost instead."
+        iface_ip="127.0.0.1"
+    fi
+
+    log "INFO" "Running SYN scan on $IFACE. This may take a moment..."
 
     local nmap_out
-    nmap_out="$(nmap -sS --open localhost 2>/dev/null || true)"
+    # -sS: SYN scan | -O: OS detection | --open: show open ports only
+    nmap_out="$(nmap -sS -O --open "$iface_ip" 2>/dev/null || true)"
 
-    if ! echo "$nmap_out" | grep -q "Nmap scan report"; then
-        log "WARN" "nmap SYN scan produced no report (may lack CAP_NET_RAW, e.g. in a container) — falling back to ss."
-        audit_open_ports_ss
-        return
+    local open_count=0
+
+    if [[ -z "$nmap_out" ]] || ! echo "$nmap_out" | grep -q "Nmap scan report"; then
+        log "WARN" "nmap produced no usable report."
+    else
+        open_count="$(echo "$nmap_out" | grep -cE "^[0-9]+/(tcp|udp)" || true)"
+
+        log "INFO" "Open ports detected: $open_count"
+
+        echo "$nmap_out" | grep -E "^(PORT|[0-9]+/(tcp|udp))" | while IFS= read -r line; do
+            log "INFO" "  $line"
+        done || true
     fi
 
-    local open_count
-    open_count="$(echo "$nmap_out" | grep -c "^[0-9]" || true)"
+    log "INFO" ""
+    log "INFO" "Listening sockets according to ss:"
 
-    log "INFO" "Open ports detected: $open_count"
-    if [[ "$open_count" -gt 0 ]]; then
-        echo "$nmap_out" | grep -E "^(PORT|[0-9])" | while IFS= read -r line; do
+    local ss_out
+    ss_out="$(ss -tulnH 2>/dev/null || true)"
+
+    if [[ -n "$ss_out" ]]; then
+        echo "$ss_out" | while IFS= read -r line; do
             log "INFO" "  $line"
         done
+    else
+        log "WARN" "ss returned no listening sockets."
     fi
 
+    # Flag commonly risky/unnecessary open ports
     local risky_ports=("21" "23" "25" "111" "135" "139" "445" "512" "513" "514")
     for port in "${risky_ports[@]}"; do
         if echo "$nmap_out" | grep -qE "^${port}/"; then
@@ -213,43 +255,42 @@ audit_open_ports() {
     fi
 }
 
-# Fallback port audit using ss (works without raw-socket privileges)
-audit_open_ports_ss() {
-    local ss_out
-    ss_out="$(ss -tulnH 2>/dev/null || true)"
-
-    if [[ -z "$ss_out" ]]; then
-        log "WARN" "ss returned no output either — unable to audit listening ports."
-        return
-    fi
-
-    local open_count
-    open_count="$(echo "$ss_out" | wc -l || true)"
-    log "INFO" "Listening sockets detected via ss: $open_count"
-
-    echo "$ss_out" | while IFS= read -r line; do
-        log "INFO" "  $line"
-    done
-
-    local risky_ports=("21" "23" "25" "111" "135" "139" "445" "512" "513" "514")
-    for port in "${risky_ports[@]}"; do
-        if echo "$ss_out" | grep -qE ":${port}\b"; then
-            log "FAIL" "High-risk port open: $port — consider closing if unused."
-        fi
-    done
-
-    if [[ "$open_count" -eq 0 ]]; then
-        log "PASS" "No listening ports detected."
-    fi
-}
-
 # MODULE 2: SUID and SGID file enumeration
 audit_suid_sgid() {
     section "MODULE 2 — SUID / SGID File Enumeration"
 
+    local known_dirs=("/usr/bin/" "/bin/" "/usr/sbin/" "/sbin/" "/usr/libexec/")
+
+    # Whitelist of well-known legitimate SUID binaries
+    local suid_whitelist=("sudo" "su" "passwd" "newgrp" "chsh" "chfn" "gpasswd"
+                    "pkexec" "mount" "umount" "ping" "ping6" "traceroute6"
+                    "ssh-agent" "Xorg" "screen" "crontab" "at" "fusermount")
+
+    local sgid_whitelist=("wall" "write" "ssh-agent" "crontab" "expiry" "chage" 
+                    "mlocate" "mlocate.updatedb" "ssh-keysign" "utempter" "postdrop" "postqueue")
+
+    _is_known_binary() {
+        local fpath="$1"
+        local -n wl="$2"
+        local base
+        base="$(basename "$fpath")"
+
+        local w d
+        for w in "${wl[@]}"; do
+            if [[ "$base" == "$w" ]]; then
+                for d in "${known_dirs[@]}"; do
+                    if [[ "$fpath" == "$d"* ]]; then
+                        echo "true" && return
+                    fi
+                done
+            fi
+        done
+        echo "false"
+    }
+
     log "INFO" "Searching for SUID files (may take a moment)..."
 
-    # Find SUID files, excluding volatile/pseudo filesystems
+    # --- SUID files ---
     local suid_files
     suid_files="$(find / \
         -path /proc -prune -o \
@@ -257,43 +298,47 @@ audit_suid_sgid() {
         -path /dev -prune -o \
         -perm /4000 -type f -print 2>/dev/null | sort || true)"
 
-    # Whitelist of well-known legitimate SUID binaries
-    local whitelist=("sudo" "su" "passwd" "newgrp" "chsh" "chfn" "gpasswd"
-                     "pkexec" "mount" "umount" "ping" "ping6" "traceroute6"
-                     "ssh-agent" "Xorg" "screen" "crontab" "at" "fusermount")
-
-    local flagged=0
+    local suid_flagged=0
     while IFS= read -r sfile; do
         [[ -z "$sfile" ]] && continue
-        local base
-        base="$(basename "$sfile")"
-        local known=false
-        for w in "${whitelist[@]}"; do
-            [[ "$base" == "$w" ]] && known=true && break
-        done
-
-        if [[ "$known" == true ]]; then
+        if [[ "$(_is_known_binary "$sfile" suid_whitelist)" == "true" ]]; then
             log "PASS" "Known SUID binary: $sfile"
         else
             log "WARN" "Unexpected SUID binary: $sfile — review manually."
-            (( flagged++ )) || true
+            (( suid_flagged++ )) || true
         fi
     done <<< "$suid_files"
 
-    log "INFO" "Searching for SGID files..."
-    local sgid_count
-    sgid_count="$(find / \
+    # --- SGID files ---
+    log "INFO" "Searching for SGID files (may take a moment)..."
+    
+    local sgid_files
+    sgid_files="$(find / \
         -path /proc -prune -o \
         -path /sys -prune -o \
         -path /dev -prune -o \
-        -perm /2000 -type f -print 2>/dev/null | wc -l || true)"
+        -perm /2000 -type f -print 2>/dev/null | sort || true)"
 
-    log "INFO" "Total SGID files found: $sgid_count"
+    local sgid_flagged=0
+    while IFS= read -r sgfile; do
+        [[ -z "$sgfile" ]] && continue
 
-    if [[ "$flagged" -eq 0 ]]; then
-        log "PASS" "No unexpected SUID binaries detected."
+        if [[ "$(_is_known_binary "$sgfile" sgid_whitelist)" == "true" ]]; then
+            log "PASS" "Known SGID binary: $sgfile"
+        else
+            log "WARN" "Unexpected SGID binary: $sgfile — review manually."
+            (( sgid_flagged++ )) || true
+        fi
+    done <<< "$sgid_files"
+
+    unset -f _is_known_binary
+    
+    # --- Module verdict (covers both SUID and SGID) ---
+    local total_flagged=$(( suid_flagged + sgid_flagged ))
+    if [[ "$total_flagged" -eq 0 ]]; then
+        log "PASS" "No unexpected SUID/SGID files found."
     else
-        log "FAIL" "$flagged unexpected SUID file(s) found — review the WARN entries above."
+        log "FAIL" "$total_flagged unexpected SUID/SGID file(s) found — review the WARN entries above."
     fi
 }
 
@@ -302,6 +347,7 @@ audit_ssh_config() {
     section "MODULE 3 — SSH Configuration Hardening"
 
     local ssh_config="/etc/ssh/sshd_config"
+
     if [[ ! -f "$ssh_config" ]]; then
         log "WARN" "SSH config not found at $ssh_config — skipping module."
         return
@@ -309,7 +355,7 @@ audit_ssh_config() {
 
     log "INFO" "Auditing $ssh_config ..."
 
-    # Exact-match checks (drop the deprecated "Protocol" directive)
+    # Format: "SettingName ExpectedValue Description of the check"
     local checks=(
         "PermitRootLogin no         Root login should be disabled"
         "PasswordAuthentication no  Password auth should be disabled (use keys)"
@@ -325,11 +371,10 @@ audit_ssh_config() {
         local key expected desc
         key="$(echo "$check"      | awk '{print $1}')"
         expected="$(echo "$check" | awk '{print $2}')"
-        desc="$(echo "$check"     | cut -d' ' -f3-)"
+        desc="$(echo "$check" | tr -s ' ' | cut -d' ' -f3-)"
 
-        # sshd honors the FIRST matching directive, not the last — use head -1
         local current
-        current="$(grep -i "^${key}" "$ssh_config" | awk '{print $2}' | head -1 || true)"
+        current="$(grep -iE "^[[:space:]]*${key}[[:space:]]" "$ssh_config" | awk '{print $2}' | head -1 || true)"
 
         if [[ -z "$current" ]]; then
             log "WARN" "$key not set (system default applies) — $desc"
@@ -341,23 +386,22 @@ audit_ssh_config() {
             (( fail++ )) || true
         fi
     done
-
     # Numeric "at least as strict" checks
     _ssh_numeric_check() {
         local key="$1" max_ok="$2" desc="$3" cmp="$4"   # cmp: "le" or "ge"
         local current
-        current="$(grep -i "^${key}" "$ssh_config" | awk '{print $2}' | head -1 || true)"
+        current="$(grep -iE "^[[:space:]]*${key}[[:space:]]" "$ssh_config" | awk '{print $2}' | head -1 || true)"
 
         if [[ -z "$current" ]]; then
             log "WARN" "$key not set (system default applies) — $desc"
             return
         fi
         if ! [[ "$current" =~ ^[0-9]+$ ]]; then
-            log "WARN" "$key = $current (non-numeric value, e.g. uses a time-unit suffix) — $desc"
+            log "WARN" "$key = $current (non-numeric value, e.g. time-unit suffix) — $desc"
             return
         fi
         if [[ "$cmp" == "le" && "$current" -le "$max_ok" ]] || \
-        [[ "$cmp" == "ge" && "$current" -ge "$max_ok" ]]; then
+           [[ "$cmp" == "ge" && "$current" -ge "$max_ok" ]]; then
             log "PASS" "$key = $current — $desc"
             (( pass++ )) || true
         else
@@ -366,8 +410,8 @@ audit_ssh_config() {
         fi
     }
 
-    _ssh_numeric_check "MaxAuthTries"        3   "Limit authentication attempts"   le
-    _ssh_numeric_check "ClientAliveInterval" 300 "Idle timeout should be set"      le
+    _ssh_numeric_check "MaxAuthTries"        3   "Limit authentication attempts"    le
+    _ssh_numeric_check "ClientAliveInterval" 300 "Idle timeout should be set"       le
     _ssh_numeric_check "LoginGraceTime"      60  "Login grace time should be short" le
 
     log "INFO" "SSH audit complete. PASS: $pass | FAIL: $fail"
@@ -395,14 +439,19 @@ audit_world_writable() {
         if [[ -d "$wfile" ]]; then
             local perms
             perms="$(stat -c "%a" "$wfile" 2>/dev/null || true)"
-            if [[ "${perms:0:1}" == "1" ]]; then
+            if [[ -n "$perms" ]] && (( 8#$perms & 01000 )); then
                 log "PASS" "Sticky-bit directory (OK): $wfile"
                 continue
             fi
         fi
 
-        log "WARN" "World-writable: $wfile"
+        if [[ -d "$wfile" ]]; then
+            log "WARN" "World-writable directory: $wfile"
+        else
+            log "WARN" "World-writable file: $wfile"
+        fi
         (( count++ )) || true
+
     done <<< "$ww_files"
 
     if [[ "$count" -eq 0 ]]; then
@@ -422,9 +471,9 @@ audit_password_policy() {
     # --- login.defs aging policy ---
     if [[ -f "$login_defs" ]]; then
         local pass_max_days pass_min_days pass_warn_age
-        pass_max_days="$(grep -E "^PASS_MAX_DAYS" "$login_defs" | awk '{print $2}' || true)"
-        pass_min_days="$(grep -E "^PASS_MIN_DAYS" "$login_defs" | awk '{print $2}' || true)"
-        pass_warn_age="$(grep -E "^PASS_WARN_AGE"  "$login_defs" | awk '{print $2}' || true)"
+        pass_max_days="$(grep -E "^[[:space:]]*PASS_MAX_DAYS[[:space:]]" "$login_defs" | awk '{print $2}' | tail -1 || true)"
+        pass_min_days="$(grep -E "^[[:space:]]*PASS_MIN_DAYS[[:space:]]" "$login_defs" | awk '{print $2}' | tail -1 || true)"
+        pass_warn_age="$(grep -E "^[[:space:]]*PASS_WARN_AGE[[:space:]]"  "$login_defs" | awk '{print $2}' | tail -1 || true)"
 
         # SC2015 fix: use explicit if/else instead of && || chaining
         if [[ "${pass_max_days:-99999}" -le 90 ]]; then
@@ -450,6 +499,7 @@ audit_password_policy() {
 
     # --- Shadow file checks ---
     if [[ -f "$shadow" ]]; then
+        # Accounts with empty or locked passwords (excluding root)
         # Truly empty password hash — real risk
         local empty_pw
         empty_pw="$(awk -F: '$2 == "" && $1 != "root" {print $1}' "$shadow" || true)"
@@ -459,16 +509,18 @@ audit_password_policy() {
             log "PASS" "No accounts with empty passwords found."
         fi
 
-        # Locked accounts ("!", "!!", or "*") — expected/secure state, just informational
+        # Locked accounts ("!", "!!", or "*") — expected/secure state, informational only
         local locked_pw
-        locked_pw="$(awk -F: '($2 ~ /^!/ || $2 == "*") && $1 != "root" {print $1}' "$shadow" || true)"
+        locked_pw="$(awk -F: '($2 ~ /^!/ || $2 == "*") && $1 != "root" {print $1}' \
+            "$shadow" || true)"
         if [[ -n "$locked_pw" ]]; then
             log "INFO" "Locked accounts (cannot authenticate via password): $(echo "$locked_pw" | tr '\n' ' ')"
         fi
 
         # Non-root accounts with UID 0 (privilege escalation risk)
         local uid0_users
-        uid0_users="$(awk -F: '($3 == 0) && ($1 != "root") {print $1}' /etc/passwd || true)"
+        uid0_users="$(awk -F: '($3 == 0) && ($1 != "root") {print $1}' \
+            /etc/passwd || true)"
         if [[ -n "$uid0_users" ]]; then
             log "FAIL" "Non-root UID 0 account(s) found: $uid0_users"
         else
@@ -484,59 +536,95 @@ audit_firewall() {
     section "MODULE 6 — Firewall Status"
 
     local found_any=false
+    local active_count=0
 
+    # UFW
     if command -v ufw &>/dev/null; then
         found_any=true
+
         local ufw_status
         ufw_status="$(ufw status 2>/dev/null | head -1 || true)"
+
         log "INFO" "UFW status: $ufw_status"
-        if echo "$ufw_status" | grep -qi "active"; then
+
+        if [[ "${ufw_status,,}" == *"status: active"* ]]; then
+            active_count=$((active_count+1))
             log "PASS" "UFW firewall is active."
         else
-            log "FAIL" "UFW firewall is inactive — enable with: ufw enable"
+            log "WARN" "UFW installed but inactive."
         fi
     fi
 
+
+    # iptables
     if command -v iptables &>/dev/null; then
         found_any=true
-        local rule_count
-        rule_count="$(iptables -L -n 2>/dev/null | grep -c "^[A-Z]" || true)"
-        log "INFO" "iptables chains found: $rule_count"
 
-        local input_policy
-        input_policy="$(iptables -L INPUT -n 2>/dev/null \
-            | head -1 | grep -oE "policy [A-Z]+" | awk '{print $2}' || true)"
+        local backend
+        backend="$(iptables -V 2>/dev/null || true)"
 
-        if [[ "$input_policy" == "DROP" || "$input_policy" == "REJECT" ]]; then
-            log "PASS" "iptables INPUT default policy: $input_policy"
+        log "INFO" "iptables backend: $backend"
+
+        local rules
+        rules="$(iptables -L -n --line-numbers 2>/dev/null \
+            | awk '/^[0-9]+/ {c++} END {print c+0}' || true)"
+
+        log "INFO" "iptables rules: $rules"
+
+        local policy
+        policy="$(iptables -L INPUT -n 2>/dev/null \
+            | head -1 \
+            | awk '/policy/ {print $4}' || true)"
+
+        if [[ "$policy" == "DROP" || "$policy" == "REJECT" ]]; then
+            active_count=$((active_count+1))
+            log "PASS" "iptables INPUT policy: $policy"
+        elif [[ "$rules" -gt 0 ]]; then
+            log "WARN" "iptables has rules but INPUT policy is $policy"
         else
-            log "WARN" "iptables INPUT default policy: ${input_policy:-UNKNOWN} — consider setting to DROP"
+            log "WARN" "iptables has no filtering rules."
         fi
     fi
 
+
+    # nftables
     if command -v nft &>/dev/null; then
         found_any=true
-        local nft_count
-        nft_count="$(nft list ruleset 2>/dev/null | grep -c "chain" || true)"
-        log "INFO" "nftables chains found: $nft_count"
-        if [[ "$nft_count" -gt 0 ]]; then
-            log "PASS" "nftables ruleset is active with $nft_count chain(s)."
+
+        local chains
+        chains="$(nft list ruleset 2>/dev/null \
+            | awk '/^[[:space:]]*chain / {c++} END {print c+0}' || true)"
+
+        log "INFO" "nftables chains: $chains"
+
+        if [[ "$chains" -gt 0 ]]; then
+            active_count=$((active_count+1))
+            log "PASS" "nftables ruleset active."
         else
-            log "WARN" "nftables is installed but no chains are defined."
+            log "WARN" "nftables installed but empty."
         fi
     fi
 
+
+    # firewalld
     if command -v firewall-cmd &>/dev/null; then
         found_any=true
-        if firewall-cmd --state &>/dev/null; then
-            log "PASS" "firewalld is running."
+
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet firewalld; then
+            active_count=$((active_count+1))
+            log "PASS" "firewalld service active."
         else
-            log "FAIL" "firewalld is installed but not running."
+            log "WARN" "firewalld installed but inactive."
         fi
     fi
 
+
     if [[ "$found_any" == false ]]; then
-        log "FAIL" "No firewall tooling detected (ufw/iptables/nft/firewalld) — host has no host-based firewall."
+        log "FAIL" "No firewall framework detected."
+    elif [[ "$active_count" -eq 0 ]]; then
+        log "FAIL" "Firewall tools exist but no active firewall detected."
+    elif [[ "$active_count" -gt 1 ]]; then
+        log "WARN" "Multiple firewall layers appear active ($active_count). Verify configuration."
     fi
 }
 
@@ -583,14 +671,43 @@ audit_sudoers() {
         log "PASS" "No overly broad sudo rules found."
     fi
 
-    # Sudoers file must be owned root:root and mode 440
-    local perms
-    perms="$(stat -c "%a" "$sudoers_file" 2>/dev/null || true)"
-    if [[ "$perms" == "440" ]]; then
-        log "PASS" "/etc/sudoers permissions: $perms (correct)"
-    else
-        log "FAIL" "/etc/sudoers permissions: $perms (expected 440 — fix with: chmod 440 /etc/sudoers)"
+    _check_sudoers_perms() {
+        local f="$1"
+        local owner perms
+
+        owner="$(stat -c "%U:%G" "$f" 2>/dev/null || true)"
+        perms="$(stat -c "%a" "$f" 2>/dev/null || true)"
+
+        if [[ -z "$owner" || -z "$perms" ]]; then
+            log "WARN" "Could not stat $f"
+            return
+        fi
+
+        if [[ "$owner" != "root:root" ]]; then
+            log "WARN" "Bad ownership on $f: $owner (expected root:root)"
+        else
+            log "PASS" "Ownership OK on $f (root:root)"
+        fi
+
+        case "$perms" in
+            440|400)
+                log "PASS" "Permissions OK on $f ($perms)"
+                ;;
+            *)
+                log "WARN" "Unexpected permissions on $f: $perms (expected 440 or 400)"
+                ;;
+        esac
+    }
+
+    _check_sudoers_perms "$sudoers_file"
+
+    if [[ -d /etc/sudoers.d ]]; then
+        while IFS= read -r -d '' f; do
+            _check_sudoers_perms "$f"
+        done < <(find /etc/sudoers.d -maxdepth 1 -type f ! -name "*~" ! -name "*.*" -print0)
     fi
+
+    unset -f _check_sudoers_perms
 }
 
 # ---------------------------------------------------------------------------
