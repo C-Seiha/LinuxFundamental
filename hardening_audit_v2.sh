@@ -1,22 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# hardening_audit.sh — System Hardening Auditor
-# =============================================================================
-# Description : Audits a Linux system for common security misconfigurations:
-#               open ports, SUID/SGID files, SSH hardening, world-writable
-#               paths, password policy, firewall state, and sudoers risks.
-#               Produces a timestamped plain-text report in OUTPUT_DIR.
-#
-# Usage       : sudo ./hardening_audit.sh [OPTIONS]
-# Options     :
-#   -o DIR    Output directory for the report (default: ./audit_reports)
-#   -i IFACE  Network interface for port scan (default: auto-detected)
-#   -s        Silent mode — suppress colour output to terminal
-#   -h        Show this help message
-#
-# Requirements: nmap, ss, find, awk, grep, id, sudo (run as root)
-# Tested on   : Kali Linux 2024.x, Ubuntu 22.04 LTS, Debian 12
-# =============================================================================
 
 set -euo pipefail
 
@@ -129,7 +111,7 @@ check_root() {
 
 # Confirm required tools are installed before any audit runs
 check_dependencies() {
-    local deps=("nmap" "ss" "ip" "find" "awk" "grep" "cut" "stat")
+    local deps=("nmap" "ss" "ip" "find" "awk" "grep" "cut" "stat" "id")
     local missing=()
 
     for dep in "${deps[@]}"; do
@@ -201,25 +183,24 @@ audit_open_ports() {
     log "INFO" "Running SYN scan against localhost. This may take a moment..."
 
     local nmap_out
-    # -sS: SYN scan | --open: show open ports only
     nmap_out="$(nmap -sS --open localhost 2>/dev/null || true)"
 
-    # Count lines that start with a port number
-    local open_count
-    open_count="$(echo "$nmap_out" | grep -c "^[0-9]" || true)"
-
-    if [[ -z "$nmap_out" || "$open_count" -eq 0 ]]; then
-        log "WARN" "nmap SYN scan returned no results (may lack CAP_NET_RAW, e.g. in a container) — falling back to ss."
+    if ! echo "$nmap_out" | grep -q "Nmap scan report"; then
+        log "WARN" "nmap SYN scan produced no report (may lack CAP_NET_RAW, e.g. in a container) — falling back to ss."
         audit_open_ports_ss
         return
     fi
 
-    log "INFO" "Open ports detected: $open_count"
-    echo "$nmap_out" | grep -E "^(PORT|[0-9])" | while IFS= read -r line; do
-        log "INFO" "  $line"
-    done
+    local open_count
+    open_count="$(echo "$nmap_out" | grep -c "^[0-9]" || true)"
 
-    # Flag commonly risky/unnecessary open ports
+    log "INFO" "Open ports detected: $open_count"
+    if [[ "$open_count" -gt 0 ]]; then
+        echo "$nmap_out" | grep -E "^(PORT|[0-9])" | while IFS= read -r line; do
+            log "INFO" "  $line"
+        done
+    fi
+
     local risky_ports=("21" "23" "25" "111" "135" "139" "445" "512" "513" "514")
     for port in "${risky_ports[@]}"; do
         if echo "$nmap_out" | grep -qE "^${port}/"; then
@@ -321,7 +302,6 @@ audit_ssh_config() {
     section "MODULE 3 — SSH Configuration Hardening"
 
     local ssh_config="/etc/ssh/sshd_config"
-
     if [[ ! -f "$ssh_config" ]]; then
         log "WARN" "SSH config not found at $ssh_config — skipping module."
         return
@@ -329,18 +309,14 @@ audit_ssh_config() {
 
     log "INFO" "Auditing $ssh_config ..."
 
-    # Format: "SettingName ExpectedValue Description of the check"
+    # Exact-match checks (drop the deprecated "Protocol" directive)
     local checks=(
         "PermitRootLogin no         Root login should be disabled"
         "PasswordAuthentication no  Password auth should be disabled (use keys)"
         "PermitEmptyPasswords no    Empty passwords must be denied"
-        "Protocol 2                 Must use SSH protocol version 2"
         "X11Forwarding no           X11 forwarding should be disabled"
-        "MaxAuthTries 3             Limit authentication attempts"
         "UsePAM yes                 PAM should be enabled"
         "AllowTcpForwarding no      TCP forwarding should be disabled if unused"
-        "ClientAliveInterval 300    Idle timeout should be set"
-        "LoginGraceTime 60          Login grace time should be short"
     )
 
     local pass=0 fail=0
@@ -351,10 +327,9 @@ audit_ssh_config() {
         expected="$(echo "$check" | awk '{print $2}')"
         desc="$(echo "$check"     | cut -d' ' -f3-)"
 
-        # Read the last uncommented assignment for this key
+        # sshd honors the FIRST matching directive, not the last — use head -1
         local current
-        current="$(grep -i "^${key}" "$ssh_config" \
-            | awk '{print $2}' | tail -1 || true)"
+        current="$(grep -i "^${key}" "$ssh_config" | awk '{print $2}' | head -1 || true)"
 
         if [[ -z "$current" ]]; then
             log "WARN" "$key not set (system default applies) — $desc"
@@ -366,6 +341,34 @@ audit_ssh_config() {
             (( fail++ )) || true
         fi
     done
+
+    # Numeric "at least as strict" checks
+    _ssh_numeric_check() {
+        local key="$1" max_ok="$2" desc="$3" cmp="$4"   # cmp: "le" or "ge"
+        local current
+        current="$(grep -i "^${key}" "$ssh_config" | awk '{print $2}' | head -1 || true)"
+
+        if [[ -z "$current" ]]; then
+            log "WARN" "$key not set (system default applies) — $desc"
+            return
+        fi
+        if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+            log "WARN" "$key = $current (non-numeric value, e.g. uses a time-unit suffix) — $desc"
+            return
+        fi
+        if [[ "$cmp" == "le" && "$current" -le "$max_ok" ]] || \
+        [[ "$cmp" == "ge" && "$current" -ge "$max_ok" ]]; then
+            log "PASS" "$key = $current — $desc"
+            (( pass++ )) || true
+        else
+            log "FAIL" "$key = $current (expected ${cmp}: $max_ok) — $desc"
+            (( fail++ )) || true
+        fi
+    }
+
+    _ssh_numeric_check "MaxAuthTries"        3   "Limit authentication attempts"   le
+    _ssh_numeric_check "ClientAliveInterval" 300 "Idle timeout should be set"      le
+    _ssh_numeric_check "LoginGraceTime"      60  "Login grace time should be short" le
 
     log "INFO" "SSH audit complete. PASS: $pass | FAIL: $fail"
 }
@@ -447,20 +450,25 @@ audit_password_policy() {
 
     # --- Shadow file checks ---
     if [[ -f "$shadow" ]]; then
-        # Accounts with empty or locked passwords (excluding root)
+        # Truly empty password hash — real risk
         local empty_pw
-        empty_pw="$(awk -F: '($2 == "" || $2 == "!!") && $1 != "root" {print $1}' \
-            "$shadow" || true)"
+        empty_pw="$(awk -F: '$2 == "" && $1 != "root" {print $1}' "$shadow" || true)"
         if [[ -n "$empty_pw" ]]; then
-            log "FAIL" "Accounts with no/locked password: $empty_pw"
+            log "FAIL" "Accounts with EMPTY password hash: $empty_pw"
         else
             log "PASS" "No accounts with empty passwords found."
         fi
 
+        # Locked accounts ("!", "!!", or "*") — expected/secure state, just informational
+        local locked_pw
+        locked_pw="$(awk -F: '($2 ~ /^!/ || $2 == "*") && $1 != "root" {print $1}' "$shadow" || true)"
+        if [[ -n "$locked_pw" ]]; then
+            log "INFO" "Locked accounts (cannot authenticate via password): $(echo "$locked_pw" | tr '\n' ' ')"
+        fi
+
         # Non-root accounts with UID 0 (privilege escalation risk)
         local uid0_users
-        uid0_users="$(awk -F: '($3 == 0) && ($1 != "root") {print $1}' \
-            /etc/passwd || true)"
+        uid0_users="$(awk -F: '($3 == 0) && ($1 != "root") {print $1}' /etc/passwd || true)"
         if [[ -n "$uid0_users" ]]; then
             log "FAIL" "Non-root UID 0 account(s) found: $uid0_users"
         else
@@ -475,8 +483,10 @@ audit_password_policy() {
 audit_firewall() {
     section "MODULE 6 — Firewall Status"
 
-    # UFW — Debian/Ubuntu/Kali default firewall frontend
+    local found_any=false
+
     if command -v ufw &>/dev/null; then
+        found_any=true
         local ufw_status
         ufw_status="$(ufw status 2>/dev/null | head -1 || true)"
         log "INFO" "UFW status: $ufw_status"
@@ -487,8 +497,8 @@ audit_firewall() {
         fi
     fi
 
-    # iptables — universal Linux packet filter
     if command -v iptables &>/dev/null; then
+        found_any=true
         local rule_count
         rule_count="$(iptables -L -n 2>/dev/null | grep -c "^[A-Z]" || true)"
         log "INFO" "iptables chains found: $rule_count"
@@ -504,8 +514,8 @@ audit_firewall() {
         fi
     fi
 
-    # nftables — modern replacement for iptables
     if command -v nft &>/dev/null; then
+        found_any=true
         local nft_count
         nft_count="$(nft list ruleset 2>/dev/null | grep -c "chain" || true)"
         log "INFO" "nftables chains found: $nft_count"
@@ -514,6 +524,19 @@ audit_firewall() {
         else
             log "WARN" "nftables is installed but no chains are defined."
         fi
+    fi
+
+    if command -v firewall-cmd &>/dev/null; then
+        found_any=true
+        if firewall-cmd --state &>/dev/null; then
+            log "PASS" "firewalld is running."
+        else
+            log "FAIL" "firewalld is installed but not running."
+        fi
+    fi
+
+    if [[ "$found_any" == false ]]; then
+        log "FAIL" "No firewall tooling detected (ufw/iptables/nft/firewalld) — host has no host-based firewall."
     fi
 }
 
